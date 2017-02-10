@@ -1,0 +1,225 @@
+#include <vector>
+#include <ctime>
+#include "caffe/layers/conv_gmm_layer.hpp"
+#include <iostream>
+using namespace std;
+namespace caffe {
+
+template <typename Dtype>
+void ReadGaussMixFromFile(const char* filename, Dtype* data, int size) {  
+  float *buffer = new float[size];
+  LOG(INFO) << "Reading " << size << " floats\n";
+  std::ifstream fin(filename, ios::in | ios::binary );
+  int k = fin.read((char *) buffer, size*sizeof(float)).gcount();
+  LOG(INFO) << "Read " << k << " floats\n";
+  if (!fin) 
+    LOG(ERROR) << "File not found: " << filename;
+  fin.close();
+  for (int i=0; i<size; i++) {
+    data[i] = buffer[i];
+  }
+  delete [] buffer;
+}
+
+template <typename Dtype>
+void ConvolutionGMMLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+					    const vector<Blob<Dtype>*>& top) {
+  BaseConvolutionLayer<Dtype>::LayerSetUp(bottom, top);
+  const int fdim = this->layer_param_.gaussmix_param().dim();
+  const int comp_num = this->layer_param_.gaussmix_param().comp_num();
+	const float _reg_factor = this->layer_param_.gaussmix_param().reg_factor();
+  const string& means_file = this->layer_param_.gaussmix_param().means_file();
+  const string& invcovs_file = this->layer_param_.gaussmix_param().invcovs_file();
+  const string& priors_file = this->layer_param_.gaussmix_param().priors_file();
+
+	reg_factor_ = _reg_factor;
+  N_ = fdim;
+  K_ = comp_num;
+
+  // Read priors, mean and inverse covariance matrix
+  means_.Reshape(1, 1, K_, N_);
+  invcovs_.Reshape(1, 1, K_, N_);
+  priors_.Reshape(1, 1, 1, K_);
+//activations hold mixture index that have highest probability of corresponding kernel	
+  activations_ = new unsigned int[this->blobs_[0]->channels() * this->blobs_[0]->num()];
+
+  LOG(INFO) << "Reading " << means_file.c_str() << "\n";
+  ReadGaussMixFromFile(means_file.c_str(),(means_.mutable_cpu_data()), K_*N_);
+  LOG(INFO) << "Reading " << invcovs_file.c_str() << "\n";
+  ReadGaussMixFromFile(invcovs_file.c_str(),(invcovs_.mutable_cpu_data()), K_*N_);
+  LOG(INFO) << "Reading " << priors_file.c_str() << "\n";
+  ReadGaussMixFromFile(priors_file.c_str(),(priors_.mutable_cpu_data()), K_); 
+
+  Dtype* invcovs = invcovs_.mutable_cpu_data();
+  Dtype* priors = priors_.mutable_cpu_data();
+//  Dtype* means = means_.mutable_cpu_data();
+  
+  Dtype eps = 1e-15;
+  // compute log priors and combine them  with log detetminant of covariance matrices
+  for (int i=0; i<K_; i++) {
+	 priors[i] = log(priors[i]) - (N_/2)*log(2*3.14159265359);
+	 for (int j=0; j<N_; j++) {
+    	 priors[i] -= 0.5*log(1/(invcovs[i*N_ + j]+eps));
+    }
+ 	 LOG(INFO) << priors[i] << " ";
+  }
+ // for (int i = 0; i < N_ ; ++i){
+ // 	LOG(INFO) << invcovs[i] << "" ;
+ // }
+
+}
+
+template <typename Dtype>
+void ConvolutionGMMLayer<Dtype>::Reshape(const vector<Blob<Dtype>*>& bottom,
+					    const vector<Blob<Dtype>*>& top) {
+  BaseConvolutionLayer<Dtype>::Reshape(bottom, top);
+ 
+  //CHECK_EQ(bottom[0]->channels() * bottom[0]->width() * bottom[0]->height(), N_);
+  xcentered_.Reshape(1, 1, 1 , N_);
+  assnw_.Reshape(1, 1, K_, bottom[0]->num());
+  temp_.Reshape(1, 1, 1, N_);
+  //top[0]->Reshape(1, 1, 1, 1);
+  
+}
+
+template <typename Dtype>
+void ConvolutionGMMLayer<Dtype>::compute_output_shape() {
+  const int* kernel_shape_data = this->kernel_shape_.cpu_data();
+  const int* stride_data = this->stride_.cpu_data();
+  const int* pad_data = this->pad_.cpu_data();
+  const int* dilation_data = this->dilation_.cpu_data();
+  this->output_shape_.clear();
+  for (int i = 0; i < this->num_spatial_axes_; ++i) {
+    // i + 1 to skip channel axis
+    const int input_dim = this->input_shape(i + 1);
+    const int kernel_extent = dilation_data[i] * (kernel_shape_data[i] - 1) + 1;
+    const int output_dim = (input_dim + 2 * pad_data[i] - kernel_extent)
+        / stride_data[i] + 1;
+    this->output_shape_.push_back(output_dim);
+  }
+}
+
+template <typename Dtype>
+void ConvolutionGMMLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top) {
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+
+	const Dtype* means = means_.cpu_data();
+  const Dtype* invcovs = invcovs_.cpu_data();
+  const Dtype* priors = priors_.cpu_data();
+  
+  Dtype * temp_data = temp_.mutable_cpu_data();
+  Dtype * xc_data = xcentered_.mutable_cpu_data();
+  Dtype temp = 0 ;
+ 	Dtype sloss = -100000000;
+	Dtype reg_loss = 0;
+
+  //for each kernel calculate membership and pick max 
+  for(int i = 0 ; i< this->blobs_[0]->channels()* this->blobs_[0]->num();++i){
+	   temp = 0 ;
+	   sloss = -100000000;	 
+		// compute w - membership confidences
+//		clock_t begin = clock();
+		 for (int j=0; j<K_; j++ ) {  
+
+      // take mean out
+      caffe_sub(N_, weight +i*N_, means + j*N_, xc_data);        
+      
+      // apply inverse covariance 
+      caffe_mul(N_, xc_data, invcovs + j*N_, temp_data);    			
+      Dtype dot = caffe_cpu_dot(N_, temp_data, xc_data);    
+      
+
+      // compute the membership confidences
+      temp  =  - 0.5 * dot;
+      
+      // log-sum-exp approximation - pick the best component
+      if ( sloss < temp + priors[j] )  {
+				sloss = temp + priors[j];
+				activations_[i] = j ;
+        }             
+      }
+
+	//	 clock_t end = clock();
+	//	 double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
+
+		 		 reg_loss += sloss; 
+	}
+
+
+	LOG(INFO) << "reg_loss " << reg_loss << " ";
+
+  
+	for (int i = 0; i < bottom.size(); ++i) {
+    const Dtype* bottom_data = bottom[i]->cpu_data();
+    Dtype* top_data = top[i]->mutable_cpu_data();
+    for (int n = 0; n < this->num_; ++n) {
+      this->forward_cpu_gemm(bottom_data + n * this->bottom_dim_, weight,
+          top_data + n * this->top_dim_);
+      if (this->bias_term_) {
+        const Dtype* bias = this->blobs_[1]->cpu_data();
+        this->forward_cpu_bias(top_data + n * this->top_dim_, bias);
+      }
+    }
+  }
+}
+
+template <typename Dtype>
+void ConvolutionGMMLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+      const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+  const Dtype* weight = this->blobs_[0]->cpu_data();
+  Dtype* weight_diff = this->blobs_[0]->mutable_cpu_diff();
+
+  	const Dtype* means = means_.cpu_data();
+  const Dtype* invcovs = invcovs_.cpu_data();
+  Dtype * temp_data = temp_.mutable_cpu_data();
+  Dtype * xc_data = xcentered_.mutable_cpu_data();
+
+	const Dtype reg_factor = reg_factor_;
+	//for each kernel
+	for(int i = 0 ; i< this->blobs_[0]->channels()* this->blobs_[0]->num();++i){
+		 //calculate log-derivative 
+			caffe_sub(N_, weight + i*N_, means +activations_[i]*N_, xc_data);        
+      caffe_mul(N_, xc_data, invcovs + activations_[i]*N_,temp_data);
+			
+			// add GMM-derivative to Classification-derivative
+			caffe_axpy(N_,reg_factor,temp_data,weight_diff +i*N_);
+   //  LOG(INFO) << activations_[i] << " " ;
+	}
+  for (int i = 0; i < top.size(); ++i) {
+    const Dtype* top_diff = top[i]->cpu_diff();
+    const Dtype* bottom_data = bottom[i]->cpu_data();
+    Dtype* bottom_diff = bottom[i]->mutable_cpu_diff();
+    // Bias gradient, if necessary.
+    if (this->bias_term_ && this->param_propagate_down_[1]) {
+      Dtype* bias_diff = this->blobs_[1]->mutable_cpu_diff();
+      for (int n = 0; n < this->num_; ++n) {
+        this->backward_cpu_bias(bias_diff, top_diff + n * this->top_dim_);
+      }
+    }
+    if (this->param_propagate_down_[0] || propagate_down[i]) {
+      for (int n = 0; n < this->num_; ++n) {
+        // gradient w.r.t. weight. Note that we will accumulate diffs.
+        if (this->param_propagate_down_[0]) {
+          this->weight_cpu_gemm(bottom_data + n * this->bottom_dim_,
+              top_diff + n * this->top_dim_, weight_diff);
+        }
+        // gradient w.r.t. bottom data, if necessary.
+        if (propagate_down[i]) {
+          this->backward_cpu_gemm(top_diff + n * this->top_dim_, weight,
+              bottom_diff + n * this->bottom_dim_);
+        }
+      }
+    }
+  }
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(ConvolutionGMMLayer);
+#endif
+
+INSTANTIATE_CLASS(ConvolutionGMMLayer);
+REGISTER_LAYER_CLASS(ConvolutionGMM);
+
+
+}  // namespace caffe
