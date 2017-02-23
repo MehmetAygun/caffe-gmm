@@ -8,52 +8,8 @@ namespace caffe {
 template <typename Dtype>
 void ConvolutionGMMLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
       const vector<Blob<Dtype>*>& top) {
-  const Dtype* weight = this->blobs_[0]->cpu_data();
-
-	const Dtype* means = means_.cpu_data();
-  const Dtype* invcovs = invcovs_.cpu_data();
-  const Dtype* priors = priors_.cpu_data();
-  
-  Dtype * temp_data = temp_.mutable_cpu_data();
-  Dtype * xc_data = xcentered_.mutable_cpu_data();
-  Dtype temp = 0 ;
- 	Dtype dot, sloss = -100000000;
-	Dtype reg_loss = 0 ;  
-	//for each kernel calculate membership and pick max 
-  for(int i = 0 ; i< this->blobs_[0]->channels()* this->blobs_[0]->num();++i){
-	   temp = 0 ;
-	   sloss = -100000000;	 
-		// compute w - membership confidences
-//		 clock_t begin = clock();
- 		 for (int j=0; j<K_; j++ ) {  
-			// This loop takes 0.05 sec in caffe_gpu op and 5.e-5 on cpu mode
-
-      // take mean out
-      caffe_sub(N_, weight +i*N_, means + j*N_, xc_data);        
-      
-      // apply inverse covariance 
-      caffe_mul(N_, xc_data, invcovs + j*N_, temp_data);    			
-      dot = caffe_cpu_dot(N_, temp_data, xc_data);     
-      
-      // compute the membership confidences
-      temp  =  - 0.5 * dot;
-      
-      // log-sum-exp approximation - pick the best component
-      if ( sloss < temp + priors[j] )  {
-				sloss = temp + priors[j];
-				activations_[i] = j ;
-        }             
-      }
-
-		 reg_loss =+ sloss;
-	//	 clock_t end = clock();
-	//	 double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-		}
-		LOG(INFO) << "reg_loss :" << reg_loss << " " ;
-
-//	 weight = this->blobs_[0]->gpu_data();
-
-
+  const Dtype* weight = this->blobs_[0]->gpu_data();
+	
 	for (int i = 0; i < bottom.size(); ++i) {
     const Dtype* bottom_data = bottom[i]->gpu_data();
     Dtype* top_data = top[i]->mutable_gpu_data();
@@ -66,6 +22,55 @@ void ConvolutionGMMLayer<Dtype>::Forward_gpu(const vector<Blob<Dtype>*>& bottom,
       }
     }
   }
+	weight = this->blobs_[0]->cpu_data();
+
+	const Dtype* means = means_.cpu_data();
+  const Dtype* invcovs = invcovs_.cpu_data();
+  const Dtype* priors = priors_.cpu_data();
+  
+  Dtype * temp_data = temp_.mutable_cpu_data();
+  Dtype * xc_data = xcentered_.mutable_cpu_data();
+  Dtype temp = 0 ;
+ 	Dtype dot, sloss = -100000000;
+	Dtype reg_loss = 0 ;  
+	//for each kernel calculate membership and pick max 
+  //for each 5th pass re-calculate membership 
+	if(this->phase_ == 0){ // if not test
+	
+		for(int i = 0 ; i< this->blobs_[0]->channels()* this->blobs_[0]->num();++i){
+	  	temp = 0 ;
+	  	sloss = -100000000;	 
+		// compute w - membership confidences
+		// clock_t begin = clock();
+ 		 	for (int j=0; j<K_; j++ ) {  
+			// This loop takes 0.05 sec in caffe_gpu op and 5.e-5 on cpu mode
+
+      // take mean out
+      caffe_sub(N_, weight +i*N_, means + j*N_, xc_data);        
+      
+      // apply inverse covariance 
+      caffe_mul(N_, xc_data, invcovs + j*N_, temp_data);    			
+			
+			dot = caffe_cpu_dot(N_, temp_data, xc_data);     
+      
+      // compute the membership confidences
+      temp  =  - 0.5 * dot;
+      
+      // log-sum-exp approximation - pick the best component
+      if ( sloss < temp + priors[j] )  {
+					sloss = temp + priors[j];
+					activations_[i] = j ;
+        }             
+      }
+
+		 	reg_loss =+ sloss;
+	//	 clock_t end = clock();
+	//	 double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
+		}
+	
+pass_+=1;
+//		LOG(INFO) << "reg_loss :" << reg_loss << " " ;
+	}	
 }
 
 template <typename Dtype>
@@ -80,20 +85,18 @@ void ConvolutionGMMLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
   Dtype * temp_data = temp_.mutable_cpu_data();
   Dtype * xc_data = xcentered_.mutable_cpu_data();
 
-		
-	for(int i = 0 ; i< this->blobs_[0]->channels()* this->blobs_[0]->num();++i){
+	// Add regularization loss
+	for(int j = 0 ; j< this->blobs_[0]->channels()* this->blobs_[0]->num();++j){
 		 //calculate log-derivative 
-			caffe_sub(N_, weight + i*N_, means +activations_[i]*N_, xc_data);        
-      caffe_mul(N_, xc_data, invcovs + activations_[i]*N_,temp_data);
+		caffe_sub(N_, weight + j*N_, means +activations_[j]*N_, xc_data);        
+		caffe_mul(N_, xc_data, invcovs + activations_[j]*N_,temp_data);
 			
-			// add GMM-derivative to Classification-derivative
-			caffe_axpy(N_,reg_factor,temp_data,weight_diff +i*N_);
-   //  LOG(INFO) << activations_[i] << " " ;
-	}		
-	//transfer data to gpu
- // weight_diff = this->blobs_[0]->mutable_gpu_data();
-//	weight = this->blobs_[0]->gpu_data();
-
+		// add GMM-derivative to Classification-derivative
+		caffe_axpy(N_,reg_factor,temp_data,weight_diff +j*N_);
+  	//  LOG(INFO) << activations_[i] << " " ;
+	}	
+		
+	weight_diff = this->blobs_[0]->mutable_gpu_diff();	
 	for (int i = 0; i < top.size(); ++i) {
     const Dtype* top_diff = top[i]->gpu_diff();
     // Bias gradient, if necessary.
@@ -112,11 +115,12 @@ void ConvolutionGMMLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
           this->weight_gpu_gemm(bottom_data + n * this->bottom_dim_,
               top_diff + n * this->top_dim_, weight_diff);
         }
+
         // gradient w.r.t. bottom data, if necessary.
         if (propagate_down[i]) {
           this->backward_gpu_gemm(top_diff + n * this->top_dim_, weight,
               bottom_diff + n * this->bottom_dim_);
-        }
+				}
       }
     }
   }
