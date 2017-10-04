@@ -1,6 +1,6 @@
 # Caffe- GMM
 
-GMM Regularization layers added for ICCV TASK CV Worksop Paper.
+GMM Regularization layers added for ICCV 2017 TASK CV Workshop Paper.
 
 Corresponding layers : 
 
